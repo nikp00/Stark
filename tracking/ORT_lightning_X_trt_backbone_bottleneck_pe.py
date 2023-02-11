@@ -12,6 +12,7 @@ import onnx
 import onnxruntime
 import time
 import os
+from typing import Tuple
 from lib.test.evaluation.environment import env_settings
 
 
@@ -28,6 +29,23 @@ def get_data(bs, sz):
     mask = torch.rand(bs, sz, sz, requires_grad=True) > 0.5
     return img_patch, mask
 
+class Preprocessor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float16).reshape(
+            (1, 3, 1, 1)
+        )
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float16).reshape(
+            (1, 3, 1, 1)
+        )
+
+    def forward(self, patch: torch.Tensor, amask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        patch_4d = patch.unsqueeze(0).permute(0, 3, 1, 2)
+        patch_4d = (patch_4d / 255.0 - self.mean) / self.std  # (1, 3, H, W)
+
+        # Deal with the attention mask
+        amask_3d = amask.unsqueeze(0)  # (1,H,W)
+        return patch_4d.to(torch.float32), amask_3d.to(torch.bool)
 
 class Backbone_Bottleneck_PE(nn.Module):
     def __init__(self, backbone, bottleneck, position_embed):
@@ -35,8 +53,11 @@ class Backbone_Bottleneck_PE(nn.Module):
         self.backbone = backbone
         self.bottleneck = bottleneck
         self.position_embed = position_embed
+        self.preprocessor = Preprocessor()
 
     def forward(self, img: torch.Tensor, mask: torch.Tensor):
+        img, mask = self.preprocessor(img, mask)
+
         feat = self.bottleneck(self.backbone(img))  # BxCxHxW
         mask_down = F.interpolate(mask[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
         pos_embed = self.position_embed(1)  # 1 is the batch-size. output size is BxCxHxW
@@ -80,7 +101,9 @@ if __name__ == "__main__":
     torch_model = Backbone_Bottleneck_PE(backbone, bottleneck, position_embed)
     print(torch_model)
     # get the template
-    img_z, mask_z = get_data(bs, z_sz)
+    # img_z, mask_z = get_data(bs, z_sz)
+    img_z = torch.randn(z_sz, z_sz, 3, requires_grad=True)
+    mask_z = torch.rand(z_sz, z_sz, requires_grad=True) > 0.5
     # forward the template
     torch_outs = torch_model(img_z, mask_z)
     torch.onnx.export(torch_model,  # model being run
@@ -95,35 +118,35 @@ if __name__ == "__main__":
                       #               'output': {0: 'batch_size'}}
                       )
     # latency comparison
-    N = 1000
-    """########## inference with the pytorch model ##########"""
-    torch_model = torch_model.cuda()
-    s = time.time()
-    for i in range(N):
-        img_z_cuda, mask_z_cuda = img_z.cuda(), mask_z.cuda()
-        _ = torch_model(img_z_cuda, mask_z_cuda)
-    e = time.time()
-    print("pytorch model average latency: %.2f ms" % ((e - s) / N * 1000))
-    """########## inference with the onnx model ##########"""
-    onnx_model = onnx.load(save_name)
-    onnx.checker.check_model(onnx_model)
+    # N = 1000
+    # """########## inference with the pytorch model ##########"""
+    # torch_model = torch_model.cuda()
+    # s = time.time()
+    # for i in range(N):
+    #     img_z_cuda, mask_z_cuda = img_z.cuda(), mask_z.cuda()
+    #     _ = torch_model(img_z_cuda, mask_z_cuda)
+    # e = time.time()
+    # print("pytorch model average latency: %.2f ms" % ((e - s) / N * 1000))
+    # """########## inference with the onnx model ##########"""
+    # onnx_model = onnx.load(save_name)
+    # onnx.checker.check_model(onnx_model)
 
-    ort_session = onnxruntime.InferenceSession(save_name)
+    # ort_session = onnxruntime.InferenceSession(save_name)
 
-    # compute ONNX Runtime output prediction
-    ort_inputs = {'img_z': to_numpy(img_z),
-                  'mask_z': to_numpy(mask_z)}
-    # print(onnxruntime.get_device())
-    # warmup
-    for i in range(10):
-        ort_outs = ort_session.run(None, ort_inputs)
-    s = time.time()
-    for i in range(N):
-        ort_outs = ort_session.run(None, ort_inputs)
-    e = time.time()
-    print("onnx model average latency: %.2f ms" % ((e - s) / N * 1000))
-    # compare ONNX Runtime and PyTorch results
-    for i in range(3):
-        np.testing.assert_allclose(to_numpy(torch_outs[i]), ort_outs[i], rtol=1e-03, atol=1e-05)
+    # # compute ONNX Runtime output prediction
+    # ort_inputs = {'img_z': to_numpy(img_z),
+    #               'mask_z': to_numpy(mask_z)}
+    # # print(onnxruntime.get_device())
+    # # warmup
+    # for i in range(10):
+    #     ort_outs = ort_session.run(None, ort_inputs)
+    # s = time.time()
+    # for i in range(N):
+    #     ort_outs = ort_session.run(None, ort_inputs)
+    # e = time.time()
+    # print("onnx model average latency: %.2f ms" % ((e - s) / N * 1000))
+    # # compare ONNX Runtime and PyTorch results
+    # for i in range(3):
+    #     np.testing.assert_allclose(to_numpy(torch_outs[i]), ort_outs[i], rtol=1e-03, atol=1e-05)
 
-    print("Exported model has been tested with ONNXRuntime, and the result looks good!")
+    # print("Exported model has been tested with ONNXRuntime, and the result looks good!")

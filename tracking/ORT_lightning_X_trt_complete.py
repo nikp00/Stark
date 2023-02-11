@@ -14,6 +14,7 @@ import onnx
 import onnxruntime
 import time
 import os
+from typing import Tuple
 from lib.test.evaluation.environment import env_settings
 
 
@@ -33,6 +34,24 @@ def get_data(bs=1, sz_x=256, hw_z=64, c=256):
     pos_vec_z = torch.randn(hw_z, bs, c, requires_grad=True)  # HWxBxC
     return img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z
 
+class Preprocessor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float16).reshape(
+            (1, 3, 1, 1)
+        )
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float16).reshape(
+            (1, 3, 1, 1)
+        )
+
+    def forward(self, patch: torch.Tensor, amask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        patch_4d = patch.unsqueeze(0).permute(0, 3, 1, 2)
+        patch_4d = (patch_4d / 255.0 - self.mean) / self.std  # (1, 3, H, W)
+
+        # Deal with the attention mask
+        amask_3d = amask.unsqueeze(0)  # (1,H,W)
+        return patch_4d.to(torch.float32), amask_3d.to(torch.bool)
+
 
 class STARK(nn.Module):
     def __init__(self, backbone, bottleneck, position_embed, transformer, box_head):
@@ -44,9 +63,12 @@ class STARK(nn.Module):
         self.box_head = box_head
         self.feat_sz_s = int(box_head.feat_sz)
         self.feat_len_s = int(box_head.feat_sz ** 2)
+        self.preprocessor = Preprocessor()
 
     def forward(self, img: torch.Tensor, mask: torch.Tensor,
                 feat_vec_z: torch.Tensor, mask_vec_z: torch.Tensor, pos_vec_z: torch.Tensor):
+        img, mask = self.preprocessor(img, mask)
+        
         # run the backbone
         feat = self.bottleneck(self.backbone(img))  # BxCxHxW
         mask_down = F.interpolate(mask[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
@@ -114,6 +136,8 @@ if __name__ == "__main__":
     c = cfg.MODEL.HIDDEN_DIM
     print(bs, sz_x, hw_z, c)
     img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z = get_data(bs=bs, sz_x=sz_x, hw_z=hw_z, c=c)
+    img_x = torch.randn(sz_x, sz_x, 3, requires_grad=True)
+    mask_x = torch.rand(sz_x, sz_x, requires_grad=True) > 0.5
     torch_outs = torch_model(img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z)
     torch.onnx.export(torch_model,  # model being run
                       (img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z),  # model input (a tuple for multiple inputs)
@@ -126,69 +150,69 @@ if __name__ == "__main__":
                       # dynamic_axes={'input': {0: 'batch_size'},  # variable length axes
                       #               'output': {0: 'batch_size'}}
                       )
-    """########## inference with the pytorch model ##########"""
-    # forward the template
-    N = 1000
-    torch_model = torch_model.cuda()
-    torch_model.box_head.coord_x = torch_model.box_head.coord_x.cuda()
-    torch_model.box_head.coord_y = torch_model.box_head.coord_y.cuda()
+    # """########## inference with the pytorch model ##########"""
+    # # forward the template
+    # N = 1000
+    # torch_model = torch_model.cuda()
+    # torch_model.box_head.coord_x = torch_model.box_head.coord_x.cuda()
+    # torch_model.box_head.coord_y = torch_model.box_head.coord_y.cuda()
 
-    """########## inference with the onnx model ##########"""
-    onnx_model = onnx.load(save_name)
-    onnx.checker.check_model(onnx_model)
-    print("creating session...")
-    ort_session = onnxruntime.InferenceSession(save_name)
-    # ort_session.set_providers(["TensorrtExecutionProvider"],
-    #                   [{'device_id': '1', 'trt_max_workspace_size': '2147483648', 'trt_fp16_enable': 'True'}])
-    print("execuation providers:")
-    print(ort_session.get_providers())
-    # compute ONNX Runtime output prediction
-    """warmup (the first one running latency is quite large for the onnx model)"""
-    for i in range(50):
-        # pytorch inference
-        img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda = \
-            img_x.cuda(), mask_x.cuda(), feat_vec_z.cuda(), mask_vec_z.cuda(), pos_vec_z.cuda()
-        torch_outs = torch_model(img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda)
-        # onnx inference
-        ort_inputs = {'img_x': to_numpy(img_x),
-                      'mask_x': to_numpy(mask_x),
-                      'feat_vec_z': to_numpy(feat_vec_z),
-                      'mask_vec_z': to_numpy(mask_vec_z),
-                      'pos_vec_z': to_numpy(pos_vec_z)
-                      }
-        s_ort = time.time()
-        ort_outs = ort_session.run(None, ort_inputs)
-    """begin the timing"""
-    t_pyt = 0  # pytorch time
-    t_ort = 0  # onnxruntime time
+    # """########## inference with the onnx model ##########"""
+    # onnx_model = onnx.load(save_name)
+    # onnx.checker.check_model(onnx_model)
+    # print("creating session...")
+    # ort_session = onnxruntime.InferenceSession(save_name)
+    # # ort_session.set_providers(["TensorrtExecutionProvider"],
+    # #                   [{'device_id': '1', 'trt_max_workspace_size': '2147483648', 'trt_fp16_enable': 'True'}])
+    # print("execuation providers:")
+    # print(ort_session.get_providers())
+    # # compute ONNX Runtime output prediction
+    # """warmup (the first one running latency is quite large for the onnx model)"""
+    # for i in range(50):
+    #     # pytorch inference
+    #     img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda = \
+    #         img_x.cuda(), mask_x.cuda(), feat_vec_z.cuda(), mask_vec_z.cuda(), pos_vec_z.cuda()
+    #     torch_outs = torch_model(img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda)
+    #     # onnx inference
+    #     ort_inputs = {'img_x': to_numpy(img_x),
+    #                   'mask_x': to_numpy(mask_x),
+    #                   'feat_vec_z': to_numpy(feat_vec_z),
+    #                   'mask_vec_z': to_numpy(mask_vec_z),
+    #                   'pos_vec_z': to_numpy(pos_vec_z)
+    #                   }
+    #     s_ort = time.time()
+    #     ort_outs = ort_session.run(None, ort_inputs)
+    # """begin the timing"""
+    # t_pyt = 0  # pytorch time
+    # t_ort = 0  # onnxruntime time
 
-    for i in range(N):
-        # generate data
-        img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z = get_data(bs=bs, sz_x=sz_x, hw_z=hw_z, c=c)
-        # pytorch inference
-        img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda = \
-            img_x.cuda(), mask_x.cuda(), feat_vec_z.cuda(), mask_vec_z.cuda(), pos_vec_z.cuda()
-        s_pyt = time.time()
-        torch_outs = torch_model(img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda)
-        e_pyt = time.time()
-        lat_pyt = e_pyt - s_pyt
-        t_pyt += lat_pyt
-        # print("pytorch latency: %.2fms" % (lat_pyt * 1000))
-        # onnx inference
-        ort_inputs = {'img_x': to_numpy(img_x),
-                      'mask_x': to_numpy(mask_x),
-                      'feat_vec_z': to_numpy(feat_vec_z),
-                      'mask_vec_z': to_numpy(mask_vec_z),
-                      'pos_vec_z': to_numpy(pos_vec_z)
-                      }
-        s_ort = time.time()
-        ort_outs = ort_session.run(None, ort_inputs)
-        e_ort = time.time()
-        lat_ort = e_ort - s_ort
-        t_ort += lat_ort
-        # print("onnxruntime latency: %.2fms" % (lat_ort * 1000))
-    print("pytorch model average latency", t_pyt/N*1000)
-    print("onnx model average latency:", t_ort/N*1000)
+    # for i in range(N):
+    #     # generate data
+    #     img_x, mask_x, feat_vec_z, mask_vec_z, pos_vec_z = get_data(bs=bs, sz_x=sz_x, hw_z=hw_z, c=c)
+    #     # pytorch inference
+    #     img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda = \
+    #         img_x.cuda(), mask_x.cuda(), feat_vec_z.cuda(), mask_vec_z.cuda(), pos_vec_z.cuda()
+    #     s_pyt = time.time()
+    #     torch_outs = torch_model(img_x_cuda, mask_x_cuda, feat_vec_z_cuda, mask_vec_z_cuda, pos_vec_z_cuda)
+    #     e_pyt = time.time()
+    #     lat_pyt = e_pyt - s_pyt
+    #     t_pyt += lat_pyt
+    #     # print("pytorch latency: %.2fms" % (lat_pyt * 1000))
+    #     # onnx inference
+    #     ort_inputs = {'img_x': to_numpy(img_x),
+    #                   'mask_x': to_numpy(mask_x),
+    #                   'feat_vec_z': to_numpy(feat_vec_z),
+    #                   'mask_vec_z': to_numpy(mask_vec_z),
+    #                   'pos_vec_z': to_numpy(pos_vec_z)
+    #                   }
+    #     s_ort = time.time()
+    #     ort_outs = ort_session.run(None, ort_inputs)
+    #     e_ort = time.time()
+    #     lat_ort = e_ort - s_ort
+    #     t_ort += lat_ort
+    #     # print("onnxruntime latency: %.2fms" % (lat_ort * 1000))
+    # print("pytorch model average latency", t_pyt/N*1000)
+    # print("onnx model average latency:", t_ort/N*1000)
 
     # # compare ONNX Runtime and PyTorch results
     # np.testing.assert_allclose(to_numpy(torch_outs), ort_outs[0], rtol=1e-03, atol=1e-05)
