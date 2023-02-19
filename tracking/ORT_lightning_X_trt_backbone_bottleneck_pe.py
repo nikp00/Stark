@@ -17,17 +17,25 @@ from lib.test.evaluation.environment import env_settings
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Parse args for training')
-    parser.add_argument('--script', type=str, default='stark_lightning_X_trt', help='script name')
-    parser.add_argument('--config', type=str, default='baseline_rephead_4_lite_search5', help='yaml configure file name')
+    parser = argparse.ArgumentParser(description="Parse args for training")
+    parser.add_argument(
+        "--script", type=str, default="stark_lightning_X_trt", help="script name"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="baseline_rephead_4_lite_search5",
+        help="yaml configure file name",
+    )
     args = parser.parse_args()
     return args
 
 
-def get_data(bs, sz):
-    img_patch = torch.randn(bs, 3, sz, sz, requires_grad=True)
-    mask = torch.rand(bs, sz, sz, requires_grad=True) > 0.5
+def get_data(bs, sz, dtype=torch.float16):
+    img_patch = torch.randn(bs, 3, sz, sz, requires_grad=True, dtype=dtype)
+    mask = torch.rand(sz, sz, requires_grad=True, dtype=dtype) > 0.5
     return img_patch, mask
+
 
 class Preprocessor(nn.Module):
     def __init__(self):
@@ -39,13 +47,37 @@ class Preprocessor(nn.Module):
             (1, 3, 1, 1)
         )
 
-    def forward(self, patch: torch.Tensor, amask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        patch_4d = patch.unsqueeze(0).permute(0, 3, 1, 2)
-        patch_4d = (patch_4d / 255.0 - self.mean) / self.std  # (1, 3, H, W)
+    def forward(
+        self, patch: torch.Tensor, amask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        patch_4d = (patch / 255.0 - self.mean) / self.std  # (1, 3, H, W)
 
         # Deal with the attention mask
         amask_3d = amask.unsqueeze(0)  # (1,H,W)
-        return patch_4d.to(torch.float32), amask_3d.to(torch.bool)
+        return patch_4d, amask_3d.to(torch.bool)
+
+
+class MaskModel(nn.Module):
+    def __init__(self, size=128):
+        super().__init__()
+
+        self.max_pool2d = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+        self.size = size
+
+    def forward(self, in_img: torch.Tensor) -> torch.Tensor:
+        in_img = in_img.to(torch.float)
+
+        mask = in_img.mean(dim=1) > 0
+        mask = mask.to(torch.float) * 255
+        mask = mask.unsqueeze(0)
+        mask = self.max_pool2d(mask)
+        mask = torch.clamp(mask, 0, 1)
+        mask = mask.squeeze(0).squeeze(0)
+        mask = mask.to(torch.bool)
+        mask = torch.bitwise_not(mask)
+
+        return mask
+
 
 class Backbone_Bottleneck_PE(nn.Module):
     def __init__(self, backbone, bottleneck, position_embed):
@@ -54,13 +86,19 @@ class Backbone_Bottleneck_PE(nn.Module):
         self.bottleneck = bottleneck
         self.position_embed = position_embed
         self.preprocessor = Preprocessor()
+        self.mask_nn = MaskModel()
 
-    def forward(self, img: torch.Tensor, mask: torch.Tensor):
+    def forward(self, img: torch.Tensor):
+        mask = self.mask_nn(img)
         img, mask = self.preprocessor(img, mask)
 
         feat = self.bottleneck(self.backbone(img))  # BxCxHxW
-        mask_down = F.interpolate(mask[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
-        pos_embed = self.position_embed(1)  # 1 is the batch-size. output size is BxCxHxW
+        mask_down = F.interpolate(mask[None].float(), size=feat.shape[-2:]).to(
+            torch.bool
+        )[0]
+        pos_embed = self.position_embed(
+            1
+        )  # 1 is the batch-size. output size is BxCxHxW
         # adjust shape
         feat_vec = feat.flatten(2).permute(2, 0, 1)  # HWxBxC
         pos_embed_vec = pos_embed.flatten(2).permute(2, 0, 1)  # HWxBxC
@@ -69,7 +107,9 @@ class Backbone_Bottleneck_PE(nn.Module):
 
 
 def to_numpy(tensor):
-    return tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
+    return (
+        tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
+    )
 
 
 if __name__ == "__main__":
@@ -77,20 +117,24 @@ if __name__ == "__main__":
     save_name = "backbone_bottleneck_pe.onnx"
     """update cfg"""
     args = parse_args()
-    yaml_fname = 'experiments/%s/%s.yaml' % (args.script, args.config)
+    yaml_fname = "experiments/%s/%s.yaml" % (args.script, args.config)
     update_config_from_file(yaml_fname)
-    '''set some values'''
+    """set some values"""
     bs = 1
     z_sz = cfg.TEST.TEMPLATE_SIZE
     # build the stark model
-    model = build_stark_lightning_x_trt(cfg, phase='test')
+    model = build_stark_lightning_x_trt(cfg, phase="test")
     # load checkpoint
     if load_checkpoint:
         save_dir = env_settings().save_dir
-        checkpoint_name = os.path.join(save_dir,
-                                       "checkpoints/train/%s/%s/STARKLightningXtrt_ep0500.pth.tar"
-                                       % (args.script, args.config))
-        model.load_state_dict(torch.load(checkpoint_name, map_location='cpu')['net'], strict=True)
+        checkpoint_name = os.path.join(
+            save_dir,
+            "checkpoints/train/%s/%s/STARKLightningXtrt_ep0500.pth.tar"
+            % (args.script, args.config),
+        )
+        model.load_state_dict(
+            torch.load(checkpoint_name, map_location="cpu")["net"], strict=True
+        )
     # transfer to test mode
     model = repvgg_model_convert(model)
     model.eval()
@@ -101,52 +145,20 @@ if __name__ == "__main__":
     torch_model = Backbone_Bottleneck_PE(backbone, bottleneck, position_embed)
     print(torch_model)
     # get the template
-    # img_z, mask_z = get_data(bs, z_sz)
-    img_z = torch.randn(z_sz, z_sz, 3, requires_grad=True)
-    mask_z = torch.rand(z_sz, z_sz, requires_grad=True) > 0.5
+    img_z, mask_z = get_data(bs, z_sz, dtype=torch.float)
     # forward the template
-    torch_outs = torch_model(img_z, mask_z)
-    torch.onnx.export(torch_model,  # model being run
-                      (img_z, mask_z),  # model input (or a tuple for multiple inputs)
-                      save_name,  # where to save the model (can be a file or file-like object)
-                      export_params=True,  # store the trained parameter weights inside the model file
-                      opset_version=11,  # the ONNX version to export the model to
-                      do_constant_folding=True,  # whether to execute constant folding for optimization
-                      input_names=['img_z', 'mask_z'],  # the model's input names
-                      output_names=['feat', 'mask', 'pos'],  # the model's output names
-                      # dynamic_axes={'input': {0: 'batch_size'},  # variable length axes
-                      #               'output': {0: 'batch_size'}}
-                      )
-    # latency comparison
-    # N = 1000
-    # """########## inference with the pytorch model ##########"""
-    # torch_model = torch_model.cuda()
-    # s = time.time()
-    # for i in range(N):
-    #     img_z_cuda, mask_z_cuda = img_z.cuda(), mask_z.cuda()
-    #     _ = torch_model(img_z_cuda, mask_z_cuda)
-    # e = time.time()
-    # print("pytorch model average latency: %.2f ms" % ((e - s) / N * 1000))
-    # """########## inference with the onnx model ##########"""
-    # onnx_model = onnx.load(save_name)
-    # onnx.checker.check_model(onnx_model)
-
-    # ort_session = onnxruntime.InferenceSession(save_name)
-
-    # # compute ONNX Runtime output prediction
-    # ort_inputs = {'img_z': to_numpy(img_z),
-    #               'mask_z': to_numpy(mask_z)}
-    # # print(onnxruntime.get_device())
-    # # warmup
-    # for i in range(10):
-    #     ort_outs = ort_session.run(None, ort_inputs)
-    # s = time.time()
-    # for i in range(N):
-    #     ort_outs = ort_session.run(None, ort_inputs)
-    # e = time.time()
-    # print("onnx model average latency: %.2f ms" % ((e - s) / N * 1000))
-    # # compare ONNX Runtime and PyTorch results
-    # for i in range(3):
-    #     np.testing.assert_allclose(to_numpy(torch_outs[i]), ort_outs[i], rtol=1e-03, atol=1e-05)
-
-    # print("Exported model has been tested with ONNXRuntime, and the result looks good!")
+    torch_outs = torch_model(img_z)
+    torch.onnx.export(
+        torch_model,  # model being run
+        (img_z),  # model input (or a tuple for multiple inputs)
+        save_name,  # where to save the model (can be a file or file-like object)
+        export_params=True,  # store the trained parameter weights inside the model file
+        opset_version=11,  # the ONNX version to export the model to
+        do_constant_folding=True,  # whether to execute constant folding for optimization
+        input_names=["img"],  # the model's input names
+        output_names=[
+            "feat_z",
+            "mask_z",
+            "pos_z",
+        ],  # the model's output names
+    )
