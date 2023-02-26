@@ -68,10 +68,11 @@ class MaskModel(nn.Module):
         in_img = in_img.to(torch.float)
 
         mask = in_img.mean(dim=1) > 0
-        mask = mask.to(torch.float) * 255
+        mask = mask.to(torch.float)
+        # mask = mask.to(torch.float) * 255
         mask = mask.unsqueeze(0)
         mask = self.max_pool2d(mask)
-        mask = torch.clamp(mask, 0, 1)
+        # mask = torch.clamp(mask, 0, 1)
         mask = mask.squeeze(0).squeeze(0)
         mask = mask.to(torch.bool)
         mask = torch.bitwise_not(mask)
