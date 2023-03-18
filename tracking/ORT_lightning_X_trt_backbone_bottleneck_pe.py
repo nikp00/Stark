@@ -14,6 +14,8 @@ import time
 import os
 from typing import Tuple
 from lib.test.evaluation.environment import env_settings
+from thop import profile
+from thop.utils import clever_format
 
 
 def parse_args():
@@ -163,3 +165,7 @@ if __name__ == "__main__":
             "pos_z",
         ],  # the model's output names
     )
+
+    macs, params = profile(torch_model, inputs=(img_z))
+    macs, params = clever_format([macs, params], "%.3f")
+    print(f"Params: {params}  |  MACs: {macs}")
